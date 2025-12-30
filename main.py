@@ -1,8 +1,31 @@
 import asyncio
 import re
+import subprocess
+import sys
 from typing import List, Set
 from urllib.parse import urlparse
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
+
+# --- FIX: Install Browser if missing ---
+def install_playwright():
+    """
+    Checks if Playwright browsers are installed.
+    If not, installs them. This fixes the 'Executable doesn't exist' error on Zeabur.
+    """
+    print("🔧 Checking Playwright browser installation...")
+    try:
+        # Try to run a simple playwright command to see if it works
+        subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        print("✅ Playwright browsers installed successfully.")
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Failed to install browsers: {e}")
+        # We continue anyway, hoping they are already there, 
+        # otherwise the crawler will crash with the original error.
 
 class RecursiveCrawler:
     def __init__(self, start_url: str, max_depth: int = 3, max_pages: int = 100, include_regex: str = None):
@@ -35,12 +58,11 @@ class RecursiveCrawler:
             return False
             
         # 3. Check "What I want" (Regex filter)
-        # If include_regex is defined, URL must match it (unless it's the start_url)
         if self.include_regex and url != self.start_url:
             if not self.include_regex.search(url):
                 return False
                 
-        # Exclude common non-html files to save resources
+        # Exclude common non-html files
         if any(url.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.gif', '.pdf', '.css', '.js', '.ico']):
             return False
 
@@ -54,15 +76,15 @@ class RecursiveCrawler:
         browser_config = BrowserConfig(
             headless=True,
             verbose=False,
-            text_mode=True # Saves bandwidth, disables images
+            text_mode=True 
         )
 
         # Configure Run (Per page)
         run_config = CrawlerRunConfig(
-            cache_mode=CacheMode.ENABLED, # Use cache to speed up re-runs
-            exclude_external_links=True,  # Ask Crawl4AI to help filter
-            word_count_threshold=10,      # Skip empty pages
-            stream=True                   # Enable streaming for arun_many
+            cache_mode=CacheMode.ENABLED,
+            exclude_external_links=True,
+            word_count_threshold=10,
+            stream=True
         )
 
         async with AsyncWebCrawler(config=browser_config) as crawler:
@@ -72,10 +94,8 @@ class RecursiveCrawler:
                 
                 print(f"\n--- Depth {current_depth}: Processing {len(self.urls_to_crawl)} URLs ---")
                 
-                # We will store new links found in this batch here
                 next_depth_urls = set()
                 
-                # Process the current batch of URLs concurrently
                 results = await crawler.arun_many(
                     urls=self.urls_to_crawl,
                     config=run_config
@@ -90,7 +110,6 @@ class RecursiveCrawler:
                     self.crawled_count += 1
                     print(f"✅ Crawled ({self.crawled_count}): {result.url}")
 
-                    # --- LOGIC TO DISCOVER NEW LINKS ---
                     internal_links = result.links.get("internal", [])
                     
                     for link_data in internal_links:
@@ -98,27 +117,27 @@ class RecursiveCrawler:
                         if href and self.is_valid_link(href):
                             next_depth_urls.add(href)
 
-                    # Stop if we hit the limit mid-batch
                     if self.crawled_count >= self.max_pages:
                         break
 
-                # Prepare queue for next depth
                 self.urls_to_crawl = list(next_depth_urls)
                 current_depth += 1
 
         print(f"\n🏁 Crawl Finished. Total pages visited: {self.crawled_count}")
 
-# --- MAIN EXECUTION ---
 async def main():
     # Example: Crawl the Crawl4AI documentation
-    # It will look for links containing "api" to find API docs
     spider = RecursiveCrawler(
         start_url="https://docs.crawl4ai.com",
         max_depth=3,
         max_pages=50,
-        include_regex=r"api" # <--- CHANGE THIS regex to filter what you want
+        include_regex=r"api"
     )
     await spider.run()
 
 if __name__ == "__main__":
+    # 1. Install browsers first
+    install_playwright()
+    
+    # 2. Run the main async loop
     asyncio.run(main())
