@@ -1,93 +1,124 @@
 import asyncio
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import List, Optional
-from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode [[1]](https://apidog.com/blog/crawl4ai-tutorial/)
+import re
+from typing import List, Set
+from urllib.parse import urlparse
+from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
 
-# Import AdaptiveCrawler if available (v0.4.0+)
-try:
-    from crawl4ai import AdaptiveCrawler
-except ImportError:
-    AdaptiveCrawler = None
-
-app = FastAPI()
-
-# --- Data Models for n8n ---
-class AdaptiveRequest(BaseModel):
-    url: str
-    query: str  # What the AI should look for
-    max_pages: int = 5
-    openai_api_key: str # Pass key from n8n or set as Env Var
-
-class RecursiveRequest(BaseModel):
-    url: str
-    max_depth: int = 2
-    max_pages: int = 10
-
-# --- Endpoint 1: Adaptive Crawler ---
-@app.post("/crawl/adaptive")
-async def crawl_adaptive(request: AdaptiveRequest):
-    if not AdaptiveCrawler:
-        raise HTTPException(status_code=501, detail="AdaptiveCrawler not available in this version.")
-    
-    print(f"🧠 Starting Adaptive Crawl for: {request.query}")
-    
-    # Initialize the Adaptive Crawler
-    # Note: In production, use os.environ["OPENAI_API_KEY"] instead of passing it in JSON
-    async with AsyncWebCrawler(verbose=True) as crawler:
-        adaptive_crawler = AdaptiveCrawler(
-            crawler=crawler,
-            openai_api_key=request.openai_api_key
-        )
+class RecursiveCrawler:
+    def __init__(self, start_url: str, max_depth: int = 3, max_pages: int = 100, include_regex: str = None):
+        self.start_url = start_url
+        self.base_domain = urlparse(start_url).netloc
+        self.max_depth = max_depth
+        self.max_pages = max_pages
+        self.include_regex = re.compile(include_regex) if include_regex else None
         
-        result = await adaptive_crawler.run(
-            url=request.url,
-            query=request.query,
-            max_pages=request.max_pages
-        )
-        
-    return {"status": "success", "data": result}
+        # State tracking
+        self.visited: Set[str] = set()
+        self.urls_to_crawl: List[str] = [start_url]
+        self.crawled_count = 0
 
-# --- Endpoint 2: Simple Recursive Crawler (BFS) ---
-@app.post("/crawl/recursive")
-async def crawl_recursive(request: RecursiveRequest):
-    print(f"🕸️ Starting Recursive Crawl: {request.url} (Depth: {request.max_depth})")
-    
-    visited = set()
-    queue = [(request.url, 0)] # Tuple: (url, current_depth)
-    results = []
-    
-    async with AsyncWebCrawler() as crawler:
-        while queue and len(results) < request.max_pages:
-            current_url, depth = queue.pop(0)
+    def is_valid_link(self, url: str) -> bool:
+        """
+        Filters URLs to ensure they are:
+        1. Internal (same domain)
+        2. Not visited
+        3. Match the specific regex (if provided)
+        """
+        parsed = urlparse(url)
+        
+        # 1. Check if it's the same domain
+        if parsed.netloc != self.base_domain:
+            return False
             
-            if current_url in visited or depth > request.max_depth:
-                continue
+        # 2. Check if already visited
+        if url in self.visited:
+            return False
             
-            visited.add(current_url)
-            
-            # Crawl the page
-            result = await crawler.arun(
-                url=current_url,
-                config=CrawlerRunConfig(cache_mode=CacheMode.BYPASS)
-            )
-            
-            if result.success:
-                results.append({
-                    "url": current_url,
-                    "markdown": result.markdown[:500] + "..." # Truncate for preview
-                })
+        # 3. Check "What I want" (Regex filter)
+        # If include_regex is defined, URL must match it (unless it's the start_url)
+        if self.include_regex and url != self.start_url:
+            if not self.include_regex.search(url):
+                return False
                 
-                # If not at max depth, add internal links to queue
-                if depth < request.max_depth:
-                    # Filter for internal links only to stay on domain
+        # Exclude common non-html files to save resources
+        if any(url.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.gif', '.pdf', '.css', '.js', '.ico']):
+            return False
+
+        return True
+
+    async def run(self):
+        print(f"🚀 Starting crawl on {self.start_url}")
+        print(f"🎯 Filter pattern: {self.include_regex.pattern if self.include_regex else 'Entire Website'}")
+
+        # Configure Browser (Global)
+        browser_config = BrowserConfig(
+            headless=True,
+            verbose=False,
+            text_mode=True # Saves bandwidth, disables images
+        )
+
+        # Configure Run (Per page)
+        run_config = CrawlerRunConfig(
+            cache_mode=CacheMode.ENABLED, # Use cache to speed up re-runs
+            exclude_external_links=True,  # Ask Crawl4AI to help filter
+            word_count_threshold=10,      # Skip empty pages
+            stream=True                   # Enable streaming for arun_many
+        )
+
+        async with AsyncWebCrawler(config=browser_config) as crawler:
+            current_depth = 0
+            
+            while current_depth <= self.max_depth and self.crawled_count < self.max_pages and self.urls_to_crawl:
+                
+                print(f"\n--- Depth {current_depth}: Processing {len(self.urls_to_crawl)} URLs ---")
+                
+                # We will store new links found in this batch here
+                next_depth_urls = set()
+                
+                # Process the current batch of URLs concurrently
+                results = await crawler.arun_many(
+                    urls=self.urls_to_crawl,
+                    config=run_config
+                )
+
+                for result in results:
+                    if not result.success:
+                        print(f"❌ Failed: {result.url} - {result.error_message}")
+                        continue
+
+                    self.visited.add(result.url)
+                    self.crawled_count += 1
+                    print(f"✅ Crawled ({self.crawled_count}): {result.url}")
+
+                    # --- LOGIC TO DISCOVER NEW LINKS ---
                     internal_links = result.links.get("internal", [])
-                    for link in internal_links:
-                        if link['href'] not in visited:
-                            queue.append((link['href'], depth + 1))
-                            
-    return {"status": "success", "pages_crawled": len(results), "data": results}
+                    
+                    for link_data in internal_links:
+                        href = link_data.get('href')
+                        if href and self.is_valid_link(href):
+                            next_depth_urls.add(href)
+
+                    # Stop if we hit the limit mid-batch
+                    if self.crawled_count >= self.max_pages:
+                        break
+
+                # Prepare queue for next depth
+                self.urls_to_crawl = list(next_depth_urls)
+                current_depth += 1
+
+        print(f"\n🏁 Crawl Finished. Total pages visited: {self.crawled_count}")
+
+# --- MAIN EXECUTION ---
+async def main():
+    # Example: Crawl the Crawl4AI documentation
+    # It will look for links containing "api" to find API docs
+    spider = RecursiveCrawler(
+        start_url="https://docs.crawl4ai.com",
+        max_depth=3,
+        max_pages=50,
+        include_regex=r"api" # <--- CHANGE THIS regex to filter what you want
+    )
+    await spider.run()
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    asyncio.run(main())
